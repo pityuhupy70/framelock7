@@ -1,0 +1,16 @@
+# CMake / build output
+build/
+build*/
+dist/
+dist*/
+/FrameLock/build/
+/FrameLock/dist/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.user
+CMakeCache.txt
+CMakeFiles/
+_deps/

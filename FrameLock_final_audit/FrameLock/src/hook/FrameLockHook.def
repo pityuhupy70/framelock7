@@ -1,0 +1,6 @@
+; FrameLockHook{64,32}.dll exports (phase opus55).
+; No LIBRARY line: OUTPUT_NAME differs per architecture.
+; A .def export of an extern "C" __stdcall function is matched by the MSVC linker to its decorated x86 name
+; (_vkNegotiateLoaderLayerInterfaceVersion@4) and exported undecorated, which is what the Vulkan loader looks up.
+EXPORTS
+    vkNegotiateLoaderLayerInterfaceVersion

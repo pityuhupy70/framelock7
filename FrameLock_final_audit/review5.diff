@@ -1,0 +1,151 @@
+--- a/b/FrameLock/src/hook/dllmain.cpp	2026-11-21 18:52:26.965878583 +0000
++++ b/FrameLock/src/hook/dllmain.cpp	2026-11-21 18:53:08.431414103 +0000
+@@ -128,7 +128,31 @@
+ static std::atomic<int64_t> g_stepIdx{ 0 };
+ static std::atomic<bool>    g_clockReleased{ false };
+ 
+-static int64_t HoldTicks() { return g_freq / 50; }   // 20 ms of real time at exactly B(n)
++// review5: ADAPTIVE hold. v3 held B(n) for a fixed 20 ms. On weak hardware the render thread's frame-start time read can
++// come later than 20 ms after Present returns (slow CPU, heavy input/event processing, page faults), so it saw a crept
++// value: per-frame dt jittered between 0 and 2/FPS (visible stutter / near-duplicate frames) even though the total stayed
++// exact. Now the render thread's first clock read of every step is timed, and the hold is 4x a decaying maximum of that
++// latency (clamped to 20 ms .. 1 s). The first read therefore lands in the hold window and gets exactly B(n) -> dt is
++// exactly 1/FPS. Frame limiters still finish (the creep after the hold is unchanged); they only wait a bit longer.
++// The first steps of a take use a conservative 200 ms hold (initial latency estimate 50 ms) that decays to the measured value.
++static std::atomic<DWORD>   g_renderTid{ 0 };          // thread that presents the recorded target
++static std::atomic<bool>    g_firstReadPending{ false };
++static std::atomic<int64_t> g_firstReadLat{ 0 };      // decaying max of (render-thread first read - step anchor), ticks
++static std::atomic<int64_t> g_anchorReal{ 0 };
++static int64_t HoldTicks() {
++    const int64_t minH = g_freq / 50, maxH = g_freq;   // 20 ms .. 1 s
++    int64_t h = g_firstReadLat.load(std::memory_order_relaxed) * 4;
++    return h < minH ? minH : (h > maxH ? maxH : h);
++}
++static void NoteRenderRead(int64_t real) {
++    if (!g_firstReadPending.load(std::memory_order_relaxed)) return;
++    if (GetCurrentThreadId() != g_renderTid.load(std::memory_order_relaxed)) return;
++    if (!g_firstReadPending.exchange(false, std::memory_order_acq_rel)) return;
++    int64_t lat = real - g_anchorReal.load(std::memory_order_relaxed); if (lat < 0) lat = 0;
++    int64_t cur = g_firstReadLat.load(std::memory_order_relaxed);
++    int64_t dec = cur - cur / 16;
++    g_firstReadLat.store(lat > dec ? lat : dec, std::memory_order_relaxed);
++}
+ static int64_t ClockEval(const ClockState& c, int64_t real) {
+     if (c.released) { int64_t r = real - c.releaseAt; return c.base + c.step + (r > 0 ? r : 0); }
+     int64_t e = real - c.anchor; if (e < 0) e = 0;
+@@ -139,7 +163,9 @@
+ static int64_t VirtQPC() {
+     if (!g_lock.load(std::memory_order_acquire)) return RealQPC() + g_offset.load(std::memory_order_relaxed);
+     AcquireSRWLockShared(&g_clk); ClockState c = g_cs; ReleaseSRWLockShared(&g_clk);
+-    return ClockEval(c, RealQPC());
++    int64_t real = RealQPC();
++    NoteRenderRead(real);
++    return ClockEval(c, real);
+ }
+ static int64_t VirtDelta(int64_t unitsPerSec) {
+     int64_t d = VirtQPC() - g_qpc0;
+@@ -150,12 +176,14 @@
+     g_cs.step = FrameTicks(n + 1) - FrameTicks(n);
+     g_cs.anchor = real; g_cs.hold = HoldTicks(); g_cs.released = false; g_cs.releaseAt = 0;
+     g_stepIdx = n; g_clockReleased = false;
++    g_anchorReal.store(real, std::memory_order_relaxed); g_firstReadPending.store(true, std::memory_order_release);
+ }
+ // Step 0 begins when the Present that started the take returns.
+ static void ClockStart() {
+     AcquireSRWLockExclusive(&g_clk);
+     int64_t real = RealQPC();
+     g_recBase = real + g_offset.load();   // >= every value returned so far -> monotonic
++    g_firstReadLat.store(g_freq / 20, std::memory_order_relaxed);   // review5: conservative 200 ms hold at take start
+     SetStep(0, real);
+     g_lock.store(true, std::memory_order_release);
+     ReleaseSRWLockExclusive(&g_clk);
+@@ -321,6 +349,7 @@
+ static std::atomic<bool> g_asyncFail{ false };
+ static std::wstring      g_takeDir;
+ static thread_local bool t_inPresent = false;
++static thread_local bool t_ownsBusy = false;   // review5: only the thread that set g_targetBusy may clear it
+ 
+ static void ReportAsyncFailure(int takeId, int64_t idx, const wchar_t* stage, HRESULT hr) {
+     g_failedTake = takeId;
+@@ -470,11 +499,23 @@
+     HRESULT hf = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&fac));
+     Log(L"Encoder thread: CoInitializeEx hr=0x%08X, WIC factory hr=0x%08X", (unsigned)hc, (unsigned)hf);
+     std::vector<uint8_t> bgr;
++    int savedTake = -1; int64_t savedCount = 0, savedNext = 0;   // review5: per-take integrity counters
+     for (;;) {
+         Job j;
+         { std::unique_lock<std::mutex> l(g_jMx); g_jCv.wait(l, [] { return !g_jobs.empty(); }); j = std::move(g_jobs.front()); g_jobs.pop_front(); }
+         g_jCv.notify_all();
+         if (j.end) {
++            // review5: end-of-take integrity check. Frames are encoded strictly in order, so a complete locked take has
++            // saved exactly endCount files with indices 0..endCount-1. Anything else is reported as an error instead of
++            // a silent "Finished" (e.g. a frame that never reached the queue).
++            int64_t saved = (savedTake == j.takeId) ? savedCount : 0;
++            if (g_failedTake != j.takeId && saved != j.endCount) {
++                wchar_t m[600];
++                swprintf_s(m, L"ERROR: take integrity check failed: %lld frames captured but %lld saved in order. Do not use this take; see the log.",
++                    (long long)j.endCount, (long long)saved);
++                SetStatus(m);
++                g_failedTake = j.takeId;
++            }
+             if (g_failedTake != j.takeId) {
+                 wchar_t m[800];
+                 double fps = (double)j.fpsNum / (double)j.fpsDen;
+@@ -491,6 +532,11 @@
+             continue;
+         }
+         if (j.takeId == g_failedTake) continue;   // keep output contiguous after a failure
++        if (savedTake != j.takeId) { savedTake = j.takeId; savedCount = 0; savedNext = 0; }
++        if (j.idx != savedNext) {                 // review5: index gap/duplicate in the queue = would corrupt the sequence
++            ReportAsyncFailure(j.takeId, savedNext, L"frame order check (expected index differs)", E_UNEXPECTED);
++            continue;
++        }
+         wchar_t path[MAX_PATH + 32]; swprintf_s(path, L"%s\\frame_%06lld.jpg", j.dir.c_str(), (long long)j.idx);
+         bool v = j.idx < 2;
+         const wchar_t* stage = L"WIC factory"; HRESULT e = hf; bool ok = false;
+@@ -502,6 +548,7 @@
+             ok = EncodeJpeg(fac, path, j.w, j.h, bgr.data(), v, e, stage);
+         }
+         if (ok) {
++            savedCount++; savedNext = j.idx + 1;
+             if (g_sh) { InterlockedExchange64(&g_sh->framesSaved, j.idx + 1); g_sh->width = j.w; g_sh->height = j.h; }
+             if (v || j.idx % 100 == 0) Log(L"Saved %s", path);
+         } else {
+@@ -962,7 +1009,8 @@
+         g_target = obj;
+     }
+     g_otherPresents = 0;
+-    g_targetBusy = true;                                 // cleared in FrameStepPost
++    g_targetBusy = true; t_ownsBusy = true;              // cleared in FrameStepPost (by this thread only)
++    g_renderTid.store(GetCurrentThreadId(), std::memory_order_relaxed);   // review5: adaptive hold measures this thread
+     if (g_asyncFail) { StopTake(L"async failure"); return 0; }
+     if (!want || g_clockReleased) { StopTake(L"user"); return 0; }
+     if (g_preroll > 0) {
+@@ -990,7 +1038,10 @@
+         if (r == 1) ClockStart();                        // step 0 starts after the start Present
+         else if ((r == 2 || r == 3) && g_rec) ClockAdvance();   // exactly one step per captured (or warm-up) frame
+     }
+-    g_targetBusy = false;
++    // review5: v4 cleared the flag unconditionally, so a Present of ANOTHER swapchain/window on another thread cleared it
++    // while the target was between capture and ClockAdvance -> the stop monitor could release the clock mid-step and
++    // ClockAdvance then moved time BACKWARDS (non-monotonic game time on stop).
++    if (t_ownsBusy) { t_ownsBusy = false; g_targetBusy = false; }
+ }
+ template <class Cap, class Call>
+ static auto PresentWrap(void* obj, Cap cap, Call call) -> decltype(call()) {
+@@ -1040,7 +1091,14 @@
+         if (!g_lock.load()) { warnedStep = -1; continue; }
+         bool busy = g_targetBusy.load();
+         // Stop requested while the game is stuck inside a step: let it reach Present so the take can end.
+-        if (!busy && InterlockedCompareExchange(&g_sh->wantRecord, 0, 0) == 0) { ClockRelease(); continue; }
++        if (!busy && InterlockedCompareExchange(&g_sh->wantRecord, 0, 0) == 0) {
++            // review5: re-check under the step mutex. Without it the render thread could set g_targetBusy, pass the
++            // g_clockReleased check and start capturing between our busy read and ClockRelease(); the following
++            // ClockAdvance would then move game time backwards from the released (running) value to B(n+1).
++            std::unique_lock<std::mutex> sl(g_stepMx, std::try_to_lock);
++            if (sl.owns_lock() && !g_targetBusy.load() && InterlockedCompareExchange(&g_sh->wantRecord, 0, 0) == 0) ClockRelease();
++            continue;
++        }
+         AcquireSRWLockShared(&g_clk); ClockState c = g_cs; int64_t step = g_stepIdx.load(); ReleaseSRWLockShared(&g_clk);
+         if (busy || c.released) continue;
+         double heldMs = RealMs(RealQPC() - c.anchor - c.hold - c.step);   // time spent at the step boundary

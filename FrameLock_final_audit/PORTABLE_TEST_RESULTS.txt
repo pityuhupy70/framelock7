@@ -1,0 +1,57 @@
+FrameLock — Portable test execution record
+==========================================
+
+Audit date: 2026-11-21
+Host: Linux sandbox, GCC 14.2.0
+Project source: FrameLock/tests/clock_test.cpp, plus clock_math.h and fps_parse.h
+
+1) Strict-warning build and execution
+------------------------------------
+Command (run from FrameLock/):
+  g++ -std=c++17 -O2 -pthread -Wall -Wextra -Wpedantic -Werror \
+    tests/clock_test.cpp -o /tmp/framelock-clock-tests
+  /tmp/framelock-clock-tests
+
+Result: PASS. The executable returned exit code 0. The build emitted no warnings
+(the warning set is promoted to errors with -Werror).
+
+Exact test output:
+schedule     24/1     qpc=10000000   10 h: 864001 boundaries, interval 416666..416667 ticks
+schedule     25/1     qpc=10000000   10 h: 900001 boundaries, interval 400000..400000 ticks
+schedule     30/1     qpc=10000000   10 h: 1080001 boundaries, interval 333333..333334 ticks
+schedule     50/1     qpc=10000000   10 h: 1800001 boundaries, interval 200000..200000 ticks
+schedule     60/1     qpc=10000000   10 h: 2160001 boundaries, interval 166666..166667 ticks
+schedule    120/1     qpc=10000000   10 h: 4320001 boundaries, interval 83333..83334 ticks
+schedule    144/1     qpc=10000000   10 h: 5184001 boundaries, interval 69444..69445 ticks
+schedule    240/1     qpc=10000000   10 h: 8640001 boundaries, interval 41666..41667 ticks
+schedule  24000/1001  qpc=10000000   10 h: 863137 boundaries, interval 417083..417084 ticks
+schedule  30000/1001  qpc=10000000   10 h: 1078922 boundaries, interval 333666..333667 ticks
+schedule  60000/1001  qpc=10000000   10 h: 2157843 boundaries, interval 166833..166834 ticks
+schedule  60000/1001  qpc=3579545    10 h: 2157843 boundaries, interval 59718..59719 ticks
+schedule    144/1     qpc=2531835    10 h: 5184001 boundaries, interval 17582..17583 ticks
+schedule  24000/1001  qpc=1000000000 10 h: 863137 boundaries, interval 41708333..41708334 ticks
+
+RESULT: ALL CHECKS PASSED (portable clock math + simulated commit-gate tests only)
+
+2) AddressSanitizer + UndefinedBehaviorSanitizer
+------------------------------------------------
+Command (run from FrameLock/):
+  g++ -std=c++17 -O1 -g -pthread -Wall -Wextra -Wpedantic \
+    -fsanitize=address,undefined -fno-omit-frame-pointer \
+    tests/clock_test.cpp -o /tmp/framelock-clock-tests-asan
+  ASAN_OPTIONS=detect_leaks=1 /tmp/framelock-clock-tests-asan
+
+Result: PASS. Exit code 0, no ASan/UBSan/leak diagnostic. The test executable
+again printed RESULT: ALL CHECKS PASSED.
+
+3) Scope and exclusions
+-----------------------
+These are portable arithmetic/parser and simulated state-machine tests. The
+slow-storage and write-failure cases are modeled using a test-only recorder and
+condition-variable gate; they are not tests of the actual Windows JPEG worker,
+Win32 file flush/rename semantics, or a physical storage device. The 48 reader
+threads exercise immutable clock evaluation, not the Windows SRWLOCK hook path.
+
+No Windows x64/x86 compile, GitHub Actions run, game injection, Direct3D,
+Vulkan, OpenGL, GPU/driver, real-time storage, high-resolution, weak-hardware,
+or long-recording runtime test was performed in this environment.

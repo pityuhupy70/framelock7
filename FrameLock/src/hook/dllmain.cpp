@@ -17,8 +17,8 @@
 #include <objbase.h>
 #include <shlobj.h>
 #include <d3d9.h>
-#include <d3d10.h>
 #include <d3d10_1.h>
+#include <d3d10.h>
 #include <d3d11.h>
 #include <d3d11_4.h>
 #include <d3d12.h>

@@ -17,9 +17,10 @@
 #include <objbase.h>
 #include <shlobj.h>
 #include <d3d9.h>
-#include <d3d10_1.h>
 #include <d3d10.h>
+#include <d3d10_1.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wincodec.h>
@@ -123,14 +124,14 @@ static int64_t FrameTicks(int64_t n) {
 // flushed, and atomically renamed into its final frame_NNNNNN.jpg path. No adaptive hold,
 // wall-clock creep, or watchdog advancement is permitted in strict mode.
 static SRWLOCK              g_clk = SRWLOCK_INIT;
-static ClockState           g_cs = {};
+static flclock::StepState           g_cs = {};
 static std::atomic<bool>    g_lock{ false };
 static std::atomic<int64_t> g_offset{ 0 };          // virtual - real while not locked
 static int64_t              g_recBase = 0;
 static std::atomic<int64_t> g_stepIdx{ 0 };
 static std::atomic<bool>    g_clockReleased{ false };
 
-static int64_t ClockEval(const ClockState& c, int64_t real) {
+static int64_t ClockEval(const flclock::StepState& c, int64_t real) {
     return flclock::Evaluate(c, real);
 }
 static int64_t VirtQPC() {
@@ -1464,7 +1465,7 @@ static void StopTake(const wchar_t* why) noexcept {
         e.fpsNum = g_fpsNum; e.fpsDen = g_fpsDen;
         Enqueue(std::move(e));
     } catch (...) {
-        g_failedTake = g_takeId;
+        g_failedTake.store(g_takeId.load(std::memory_order_relaxed), std::memory_order_relaxed);
         SetStatus(L"ERROR: could not enqueue take finalization (out of memory or queue failure); treat the take as incomplete.");
     }
 }
@@ -1609,7 +1610,7 @@ static DWORD WINAPI ControlThread(LPVOID) {
             if (sl.owns_lock() && !g_targetBusy.load() && InterlockedCompareExchange(&g_sh->wantRecord, 0, 0) == 0) ClockRelease();
             continue;
         }
-        AcquireSRWLockShared(&g_clk); ClockState c = g_cs; int64_t step = g_stepIdx.load(); ReleaseSRWLockShared(&g_clk);
+        AcquireSRWLockShared(&g_clk); flclock::StepState c = g_cs; int64_t step = g_stepIdx.load(); ReleaseSRWLockShared(&g_clk);
         if (busy || c.released) continue;
         double heldMs = RealMs(RealQPC() - c.anchor);   // wall time waiting at the immutable step timestamp
         if (heldMs > 3000.0 && warnedStep != step) {

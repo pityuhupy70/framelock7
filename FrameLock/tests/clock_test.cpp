@@ -13,6 +13,7 @@
 #include <random>
 #include "../src/hook/clock_math.h"
 #include "../src/hook/fps_parse.h"
+#include "../src/hook/present_gate.h"
 
 namespace {
 int failures = 0;
@@ -79,6 +80,45 @@ void TestFrameSchedule(int64_t num, int64_t den, int64_t freq, int64_t hours) {
         static_cast<long long>(minStep), static_cast<long long>(maxStep));
 }
 
+
+void TestWholePresentTransactionIsSerialized() {
+    // Exercise the exact gate class used by dllmain.cpp. The critical section represents
+    // StepPre/capture+save -> original Present -> StepPost/clock advance as one transaction.
+    flpresent::SequenceGate gate;
+    std::atomic<int> active{ 0 };
+    std::atomic<int> overlaps{ 0 };
+    std::vector<std::thread> presenters;
+    presenters.reserve(16);
+    for (int t = 0; t < 16; ++t) {
+        presenters.emplace_back([&] {
+            for (int i = 0; i < 500; ++i) {
+                auto transaction = gate.Enter();
+                if (active.fetch_add(1, std::memory_order_acq_rel) != 0)
+                    overlaps.fetch_add(1, std::memory_order_relaxed);
+                // Yield at each boundary to force competing threads to contend while the
+                // gate is held, just as other swapchains/render threads can do in a game.
+                std::this_thread::yield(); // StepPre / capture+commit
+                std::this_thread::yield(); // original Present
+                std::this_thread::yield(); // StepPost / clock advance
+                active.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        });
+    }
+    for (auto& t : presenters) t.join();
+    Check(overlaps.load() == 0, "whole Present transaction never overlaps across threads", overlaps.load(), 0);
+    Check(active.load() == 0, "Present transaction gate is fully released", active.load(), 0);
+}
+
+void TestControlThreadTryGate() {
+    flpresent::SequenceGate gate;
+    auto present = gate.Enter();
+    auto stopAttempt = gate.TryEnter();
+    Check(!stopAttempt.owns_lock(), "stop monitor never blocks behind an active Present transaction", stopAttempt.owns_lock(), 0);
+    present.unlock();
+    auto afterPresent = gate.TryEnter();
+    Check(afterPresent.owns_lock(), "stop monitor can enter after Present transaction completes", afterPresent.owns_lock(), 1);
+}
+
 void TestImmutableStepReads() {
     constexpr int64_t base = 918273645;
     constexpr int64_t step = 166666;
@@ -135,13 +175,15 @@ struct SimulatedRecorder {
     int64_t nextFrame = 0;
     int64_t virtualStep = 0;
     bool stopped = false;
-    bool CommitFrame(bool captureOk, bool encodeOk, bool flushAndRenameOk) {
+    bool CommitFrame(bool captureOk, bool encodeOk, bool flushAndRenameOk, bool anotherFrameExpected = true) {
         if (stopped || !captureOk || !encodeOk || !flushAndRenameOk) {
             stopped = true;
             return false;
         }
         ++nextFrame;
-        ++virtualStep;
+        // The clock advances only to prepare a subsequent frame. The final committed
+        // image keeps its own boundary; no extra unrecorded simulation interval is added.
+        if (anotherFrameExpected) ++virtualStep;
         return true;
     }
 };
@@ -167,6 +209,26 @@ void TestCommitGateAndNoGap() {
         Check(r.CommitFrame(true, true, true), "successful frames commit sequentially");
     Check(r.nextFrame == 100000, "long commit sequence has exact frame count", r.nextFrame, 100000);
     Check(r.virtualStep == r.nextFrame, "one saved image corresponds to one simulation step", r.virtualStep, r.nextFrame);
+
+    SimulatedRecorder finalFrame;
+    finalFrame.virtualStep = 1; // the one startup warm-up boundary before frame_000000
+    for (int64_t i = 0; i < 123; ++i) {
+        const bool anotherFrameExpected = i != 122;
+        Check(finalFrame.CommitFrame(true, true, true, anotherFrameExpected), "123-frame take commits in order");
+    }
+    Check(finalFrame.nextFrame == 123, "final-frame test committed exactly 123 images", finalFrame.nextFrame, 123);
+    Check(finalFrame.virtualStep == 123, "final frame does not advance to an unrecorded 124th step", finalFrame.virtualStep, 123);
+
+    // If F9 is pressed just after StepPost already advanced for the next frame, one
+    // pending boundary may exist at stop; it is discarded and never becomes an image.
+    SimulatedRecorder lateStop;
+    lateStop.virtualStep = 1; // startup warm-up
+    for (int64_t i = 0; i < 123; ++i)
+        Check(lateStop.CommitFrame(true, true, true), "late-stop take commits in order");
+    Check(lateStop.nextFrame == 123 && lateStop.virtualStep == 124,
+          "late user stop permits only one pending uncommitted boundary", lateStop.virtualStep, 124);
+    Check(lateStop.virtualStep - lateStop.nextFrame == 1,
+          "pending boundary is not counted as an exported frame", lateStop.virtualStep - lateStop.nextFrame, 1);
 }
 
 void TestSlowCommitDoesNotAdvanceClock() {
@@ -212,6 +274,8 @@ void TestOverflowAndInvalidRates() {
 }
 
 int main() {
+    TestWholePresentTransactionIsSerialized();
+    TestControlThreadTryGate();
     TestMulDivSmallExhaustive();
     const int64_t rates[][2] = {
         {24,1},{25,1},{30,1},{50,1},{60,1},{120,1},{144,1},{240,1},

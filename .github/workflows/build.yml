@@ -7,20 +7,36 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Pin the runner to the GitHub-hosted Windows 2022 image with VS 2022/MSVC.
+    runs-on: windows-2022
     strategy:
       fail-fast: false
       matrix:
         arch: [x64, Win32]
         vulkan: [ON]
         include:
-          # review4: diagnostic leg. If the ON legs fail only inside vk_layer.cpp / Vulkan-Headers, this leg shows
-          # whether the rest of the project (D3D/GL hook, launcher) compiles and links on its own.
           - arch: x64
             vulkan: OFF
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Verify Visual Studio installation
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            Write-Error "vswhere.exe was not found. The selected runner has no Visual Studio Installer."
+            exit 1
+          }
+          $vsPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) {
+            Write-Error "Visual Studio with the MSVC C++ x86/x64 tools was not found."
+            exit 1
+          }
+          Write-Host "Visual Studio installation: $vsPath"
+          cmake --version
 
       - name: Locate CMake project
         id: src
@@ -31,19 +47,26 @@ jobs:
           else { Write-Error "CMakeLists.txt not found"; exit 1 }
           "src=$src" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Configure (MSVC ${{ matrix.arch }}, Vulkan ${{ matrix.vulkan }})
-        run: cmake -S ${{ steps.src.outputs.src }} -B build-${{ matrix.arch }}-vk${{ matrix.vulkan }} -G "Visual Studio 17 2022" -A ${{ matrix.arch }} -DFL_ENABLE_VULKAN=${{ matrix.vulkan }}
-
-      - name: Build (Release)
-        run: cmake --build build-${{ matrix.arch }}-vk${{ matrix.vulkan }} --config Release --parallel
-
-      - name: Run portable correctness tests
-        run: ctest --test-dir build-${{ matrix.arch }}-vk${{ matrix.vulkan }} -C Release --output-on-failure
-
-      - name: Set up MSVC tools (dumpbin)
+      # Initialize the matching MSVC environment before configure/build.
+      - name: Set up MSVC tools (${{ matrix.arch }})
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: ${{ matrix.arch == 'Win32' && 'x86' || 'x64' }}
+
+      - name: Configure (MSVC ${{ matrix.arch }}, Vulkan ${{ matrix.vulkan }})
+        shell: pwsh
+        run: |
+          cmake -S "${{ steps.src.outputs.src }}" `
+            -B "build-${{ matrix.arch }}-vk${{ matrix.vulkan }}" `
+            -G "Visual Studio 17 2022" `
+            -A "${{ matrix.arch }}" `
+            -DFL_ENABLE_VULKAN=${{ matrix.vulkan }}
+
+      - name: Build (Release)
+        run: cmake --build "build-${{ matrix.arch }}-vk${{ matrix.vulkan }}" --config Release --parallel
+
+      - name: Run portable correctness tests
+        run: ctest --test-dir "build-${{ matrix.arch }}-vk${{ matrix.vulkan }}" -C Release --output-on-failure
 
       - name: Collect binaries
         shell: pwsh
@@ -52,26 +75,33 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $launcher = if ('${{ matrix.arch }}' -eq 'Win32') { 'FrameLock32.exe' } else { 'FrameLock64.exe' }
           $hook = if ('${{ matrix.arch }}' -eq 'Win32') { 'FrameLockHook32.dll' } else { 'FrameLockHook64.dll' }
-          Get-ChildItem -Path build-${{ matrix.arch }}-vk${{ matrix.vulkan }} -Recurse -File |
+          Get-ChildItem -Path "build-${{ matrix.arch }}-vk${{ matrix.vulkan }}" -Recurse -File |
             Where-Object { $_.FullName -match '[\\/]Release[\\/]' -and $_.Name -in @($launcher, $hook) } |
             ForEach-Object { Copy-Item $_.FullName $out -Force }
           Get-ChildItem $out
-          if (-not (Get-ChildItem $out -Filter *.exe)) { Write-Error "no launcher exe produced"; exit 1 }
-          if (-not (Get-ChildItem $out -Filter FrameLockHook*.dll)) { Write-Error "no hook DLL produced"; exit 1 }
+          if (-not (Get-ChildItem $out -Filter *.exe)) { Write-Error "No launcher executable was produced"; exit 1 }
+          if (-not (Get-ChildItem $out -Filter FrameLockHook*.dll)) { Write-Error "No hook DLL was produced"; exit 1 }
 
-      # review4: the Vulkan loader looks up the layer entry point by its UNDECORATED name. On Win32 an extern "C"
-      # __stdcall function is decorated (_name@4); the .def file must re-export it undecorated. Fail the build if not.
       - name: Verify hook DLL exports
         shell: pwsh
         run: |
-          foreach ($dll in Get-ChildItem dist-${{ matrix.arch }} -Filter FrameLockHook*.dll) {
+          foreach ($dll in Get-ChildItem "dist-${{ matrix.arch }}" -Filter FrameLockHook*.dll) {
             $ex = dumpbin /nologo /exports $dll.FullName | Out-String
             Write-Host $ex
-            if ($ex -notmatch '\svkNegotiateLoaderLayerInterfaceVersion\s') { Write-Error "$($dll.Name): undecorated vkNegotiateLoaderLayerInterfaceVersion export missing"; exit 1 }
-            if ($ex -match '_vkNegotiateLoaderLayerInterfaceVersion@') { Write-Error "$($dll.Name): export is decorated"; exit 1 }
+            if ($ex -notmatch '\svkNegotiateLoaderLayerInterfaceVersion\s') {
+              Write-Error "$($dll.Name): undecorated vkNegotiateLoaderLayerInterfaceVersion export missing"
+              exit 1
+            }
+            if ($ex -match '_vkNegotiateLoaderLayerInterfaceVersion@') {
+              Write-Error "$($dll.Name): export is decorated"
+              exit 1
+            }
             $hdr = dumpbin /nologo /headers $dll.FullName | Out-String
             $want = if ('${{ matrix.arch }}' -eq 'Win32') { '14C machine \(x86\)' } else { '8664 machine \(x64\)' }
-            if ($hdr -notmatch $want) { Write-Error "$($dll.Name): wrong machine type"; exit 1 }
+            if ($hdr -notmatch $want) {
+              Write-Error "$($dll.Name): wrong machine type"
+              exit 1
+            }
           }
 
       - name: Upload artifacts
@@ -81,30 +111,35 @@ jobs:
           path: dist-${{ matrix.arch }}/*
           if-no-files-found: error
 
-  # review4: one ready-to-use folder with BOTH architectures side by side. Both launchers must sit next to both hook DLLs
-  # so each launcher can register both Vulkan layer manifests (32-bit games started from FrameLock64.exe, and vice versa).
   package:
     needs: build
-    runs-on: windows-latest
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Download x64 + Win32 binaries
         uses: actions/download-artifact@v4
         with:
           pattern: FrameLock-*-vkON
           path: FrameLock-dist
           merge-multiple: true
+
       - name: Add docs
         shell: pwsh
         run: |
+          New-Item -ItemType Directory -Force -Path FrameLock-dist | Out-Null
           if (Test-Path FrameLock/README.md) { Copy-Item FrameLock/README.md FrameLock-dist/ }
           if (Test-Path BUILD_AND_STATUS.md) { Copy-Item BUILD_AND_STATUS.md FrameLock-dist/ }
           if (Test-Path FINAL_AUDIT_REPORT.md) { Copy-Item FINAL_AUDIT_REPORT.md FrameLock-dist/ }
           Get-ChildItem FrameLock-dist
           foreach ($f in 'FrameLock64.exe','FrameLock32.exe','FrameLockHook64.dll','FrameLockHook32.dll') {
-            if (-not (Test-Path "FrameLock-dist/$f")) { Write-Error "missing $f in combined package"; exit 1 }
+            if (-not (Test-Path "FrameLock-dist/$f")) {
+              Write-Error "Missing $f in combined package"
+              exit 1
+            }
           }
+
       - name: Upload combined package
         uses: actions/upload-artifact@v4
         with:

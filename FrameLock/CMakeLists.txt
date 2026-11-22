@@ -45,7 +45,7 @@ else()
 endif()
 
 # ---- hook DLL (injected into the game)
-add_library(FrameLockHook SHARED src/hook/dllmain.cpp src/hook/vk_layer.cpp src/hook/flcore.h src/hook/FrameLockHook.def)
+add_library(FrameLockHook SHARED src/hook/dllmain.cpp src/hook/vk_layer.cpp src/hook/flcore.h src/hook/present_gate.h src/hook/FrameLockHook.def)
 if(FL_ENABLE_VULKAN)
   target_include_directories(FrameLockHook PRIVATE ${vulkan_headers_SOURCE_DIR}/include)
 else()

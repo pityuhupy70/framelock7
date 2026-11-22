@@ -39,11 +39,13 @@
 #include <cstdarg>
 #include <cmath>
 #include <limits>
+#include <tlhelp32.h>
 #include <memory>
 #include "MinHook.h"
 #include "../shared.h"
 #include "flcore.h"     // PF enum + core interface used by separate capture modules (vk_layer.cpp)
 #include "clock_math.h"
+#include "present_gate.h"
 
 static HMODULE   g_hMod = nullptr;
 static FLShared* g_sh = nullptr;
@@ -76,11 +78,143 @@ static bool Hook(void* target, void* detour, void** orig, const char* name) {
     if (s != MH_OK && s != MH_ERROR_ALREADY_CREATED) {
         Log(L"Hook create failed: %S (%d)", name, (int)s); return false;
     }
-    // Already-created does not imply enabled: always retry/verify the enable operation.
+    // Every MinHook operation in this DLL goes through this helper. If CreateHook
+    // reports an existing entry and EnableHook reports MH_ERROR_ENABLED, that target
+    // is already active in this DLL's MinHook instance (status 5 is not unsupported).
     s = MH_EnableHook(target);
+    if (s == MH_ERROR_ENABLED) {
+        Log(L"Hook already enabled: %S (MinHook status %d)", name, (int)s);
+        return true;
+    }
     if (s != MH_OK) { Log(L"Hook enable failed: %S (%d)", name, (int)s); return false; }
     Log(L"Hooked %S", name);
     return true;
+}
+
+static BOOL WINAPI Hk_QPC(LARGE_INTEGER* p); // defined with the virtual-clock detours below
+
+// Windows API-set exports sometimes consist only of a short tail-jump. MinHook cannot
+// safely trampoline every such 2/5-byte stub (MH_ERROR_UNSUPPORTED_FUNCTION), but the
+// stub is still covered when its jump chain reaches an entrypoint that FrameLock hooked.
+static void* TailJmpTarget(void* entry) {
+    if (!entry) return nullptr;
+    uint8_t code[6]{};
+    SIZE_T got = 0;
+    if (!ReadProcessMemory(GetCurrentProcess(), entry, code, sizeof(code), &got) || got < 2)
+        return nullptr;
+    const uintptr_t at = reinterpret_cast<uintptr_t>(entry);
+    if (code[0] == 0xE9 && got >= 5) {                 // jmp rel32
+        int32_t rel = 0; memcpy(&rel, code + 1, sizeof(rel));
+        return reinterpret_cast<void*>(at + 5 + static_cast<intptr_t>(rel));
+    }
+    if (code[0] == 0xEB) {                            // jmp rel8
+        const int8_t rel = static_cast<int8_t>(code[1]);
+        return reinterpret_cast<void*>(at + 2 + static_cast<intptr_t>(rel));
+    }
+    if (code[0] == 0xFF && code[1] == 0x25 && got >= 6) { // jmp [rip+disp32] on x64 / jmp [abs32] on x86
+        void* target = nullptr;
+#ifdef _WIN64
+        int32_t disp = 0; memcpy(&disp, code + 2, sizeof(disp));
+        const void* slot = reinterpret_cast<const void*>(at + 6 + static_cast<intptr_t>(disp));
+#else
+        uint32_t address = 0; memcpy(&address, code + 2, sizeof(address));
+        const void* slot = reinterpret_cast<const void*>(static_cast<uintptr_t>(address));
+#endif
+        SIZE_T read = 0;
+        if (ReadProcessMemory(GetCurrentProcess(), slot, &target, sizeof(target), &read) && read == sizeof(target))
+            return target;
+    }
+    return nullptr;
+}
+
+static void* ResolveTailJumps(void* entry) {
+    void* current = entry;
+    for (unsigned hop = 0; current && hop < 8; ++hop) {
+        void* next = TailJmpTarget(current);
+        if (!next || next == current) break;
+        current = next;
+    }
+    return current;
+}
+
+static bool QpcExportCovered(void* exportAddress, void* resolvedBeforeHook,
+                             bool directlyHooked, bool rtlHooked, void* rtlAddress) {
+    if (directlyHooked) return true;
+    // Resolve the export chain BEFORE MinHook patches the destination. After patching,
+    // the first bytes of RtlQueryPerformanceCounter are a detour jump and no longer
+    // describe the original forwarding chain.
+    return rtlHooked && exportAddress && rtlAddress &&
+           (exportAddress == rtlAddress || resolvedBeforeHook == rtlAddress);
+}
+
+// Redirect resolved IAT slots that still point at the system QPC exports in loaded modules.
+// This also works when a linker omitted OriginalFirstThunk. The FrameLock DLL is excluded:
+// RealQPC must use MinHook trampolines,
+// never call its own virtual-time detour recursively. The scan is repeated during the
+// module-watch loop so late-loaded game/plugin DLLs are covered as well.
+static size_t PatchQpcIATs() {
+    // Only replace imports that still point at the real system exports. Do not overwrite
+    // another component's IAT detour: that can break overlays, profilers, or accessibility tools.
+    void* systemQpc[] = {
+        Proc(L"kernelbase.dll", "QueryPerformanceCounter"),
+        Proc(L"kernel32.dll", "QueryPerformanceCounter")
+    };
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) return 0;
+    size_t patched = 0;
+    MODULEENTRY32W module{}; module.dwSize = sizeof(module);
+    if (Module32FirstW(snapshot, &module)) do {
+        if (!module.modBaseAddr || module.hModule == g_hMod || module.modBaseSize < sizeof(IMAGE_DOS_HEADER))
+            continue;
+        HMODULE pinned = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                reinterpret_cast<LPCWSTR>(module.modBaseAddr), &pinned)) continue;
+        struct ModulePin { HMODULE h; ~ModulePin() { if (h) FreeLibrary(h); } } pin{ pinned };
+        uint8_t* base = reinterpret_cast<uint8_t*>(module.modBaseAddr);
+        const size_t imageSize = module.modBaseSize;
+        auto inImage = [&](uintptr_t rva, size_t bytes) {
+            return rva <= imageSize && bytes <= imageSize - static_cast<size_t>(rva);
+        };
+        IMAGE_DOS_HEADER dos{};
+        memcpy(&dos, base, sizeof(dos));
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0 ||
+            !inImage(static_cast<uintptr_t>(dos.e_lfanew), sizeof(IMAGE_NT_HEADERS))) continue;
+        IMAGE_NT_HEADERS* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos.e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.SizeOfImage > imageSize ||
+            nt->OptionalHeader.SizeOfImage < sizeof(IMAGE_DOS_HEADER) ||
+            nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IMPORT) continue;
+        const IMAGE_DATA_DIRECTORY dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+        if (!dir.VirtualAddress || dir.Size < sizeof(IMAGE_IMPORT_DESCRIPTOR) ||
+            !inImage(dir.VirtualAddress, dir.Size)) continue;
+        const size_t descCount = dir.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        auto* desc = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR*>(base + dir.VirtualAddress);
+        for (size_t di = 0; di < descCount && desc[di].Name; ++di) {
+            if (!inImage(desc[di].Name, 1) || !desc[di].FirstThunk ||
+                !inImage(desc[di].FirstThunk, sizeof(IMAGE_THUNK_DATA))) continue;
+            // The loader has resolved ordinary FirstThunk slots even when a linker
+            // omitted OriginalFirstThunk. Match the resolved address, not the import
+            // name, so stripped import-name tables are covered without touching other APIs.
+            auto* slots = reinterpret_cast<IMAGE_THUNK_DATA*>(base + desc[di].FirstThunk);
+            const size_t maxThunks = (imageSize - desc[di].FirstThunk) / sizeof(IMAGE_THUNK_DATA);
+            for (size_t ti = 0; ti < maxThunks && slots[ti].u1.Function; ++ti) {
+                void** slot = reinterpret_cast<void**>(&slots[ti].u1.Function);
+                void* currentTarget = reinterpret_cast<void*>(static_cast<uintptr_t>(slots[ti].u1.Function));
+                if (currentTarget == reinterpret_cast<void*>(Hk_QPC)) continue;
+                bool isSystemTarget = false;
+                for (void* qpcExport : systemQpc) {
+                    if (qpcExport && currentTarget == qpcExport) { isSystemTarget = true; break; }
+                }
+                if (!isSystemTarget) continue;
+                DWORD oldProtect = 0;
+                if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProtect)) continue;
+                InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(slot), reinterpret_cast<void*>(Hk_QPC));
+                DWORD ignored = 0; VirtualProtect(slot, sizeof(void*), oldProtect, &ignored);
+                ++patched;
+            }
+        }
+    } while (Module32NextW(snapshot, &module));
+    CloseHandle(snapshot);
+    return patched;
 }
 
 // ============================================================ virtual clock
@@ -90,6 +224,7 @@ typedef void(WINAPI* QIT_t)(PULONGLONG);
 typedef BOOL(WINAPI* QUIT_t)(PULONGLONG);
 static RtlQPC_t o_RtlQPC = nullptr;
 static QPC_t    o_QPC_kb = nullptr, o_QPC_k32 = nullptr;
+static void*    g_rtlQpcEntry = nullptr;
 
 static int64_t  g_freq = 10000000;
 static int64_t  g_qpc0 = 0;     // real QPC at init
@@ -270,13 +405,41 @@ static void InstallTimeHooks() {
         if (p2(&t)) { g_uit0 = (int64_t)t; g_haveUit0 = true; }
     }
 
-    const bool hRtlQpc = Hook(Proc(L"ntdll.dll", "RtlQueryPerformanceCounter"), (void*)Hk_RtlQPC, (void**)&o_RtlQPC, "RtlQueryPerformanceCounter");
-    const bool hBaseQpc = Hook(Proc(L"kernelbase.dll", "QueryPerformanceCounter"), (void*)Hk_QPC, (void**)&o_QPC_kb, "kernelbase!QueryPerformanceCounter");
-    const bool hKernelQpc = Hook(Proc(L"kernel32.dll", "QueryPerformanceCounter"), (void*)Hk_QPC, (void**)&o_QPC_k32, "kernel32!QueryPerformanceCounter");
-    const bool qpcReady = hRtlQpc || hBaseQpc || hKernelQpc;
+    g_rtlQpcEntry = Proc(L"ntdll.dll", "RtlQueryPerformanceCounter");
+    void* baseQpcEntry = Proc(L"kernelbase.dll", "QueryPerformanceCounter");
+    void* kernelQpcEntry = Proc(L"kernel32.dll", "QueryPerformanceCounter");
+    // Cache original export forwarding before any inline hook changes the first bytes.
+    void* baseQpcTerminal = ResolveTailJumps(baseQpcEntry);
+    void* kernelQpcTerminal = ResolveTailJumps(kernelQpcEntry);
+    const bool baseAliasesRtl = baseQpcEntry && g_rtlQpcEntry &&
+        (baseQpcEntry == g_rtlQpcEntry || baseQpcTerminal == g_rtlQpcEntry);
+    const bool kernelAliasesRtl = kernelQpcEntry && g_rtlQpcEntry &&
+        (kernelQpcEntry == g_rtlQpcEntry || kernelQpcTerminal == g_rtlQpcEntry);
+    const bool hRtlQpc = Hook(g_rtlQpcEntry, (void*)Hk_RtlQPC, (void**)&o_RtlQPC, "RtlQueryPerformanceCounter");
+    // A public export that is only a tail-jump to RtlQPC is already covered by the Rtl
+    // detour. Do not ask MinHook to install a second, ABI-different detour at the same
+    // underlying address (MH_ERROR_ENABLED / status 5 means already enabled).
+    const bool hBaseQpc = baseAliasesRtl ? hRtlQpc :
+        Hook(baseQpcEntry, (void*)Hk_QPC, (void**)&o_QPC_kb, "kernelbase!QueryPerformanceCounter");
+    const bool hKernelQpc = kernelAliasesRtl ? hRtlQpc :
+        Hook(kernelQpcEntry, (void*)Hk_QPC, (void**)&o_QPC_k32, "kernel32!QueryPerformanceCounter");
+    const bool baseCovered = QpcExportCovered(baseQpcEntry, baseQpcTerminal, hBaseQpc,
+                                               hRtlQpc, g_rtlQpcEntry);
+    const bool kernelCovered = QpcExportCovered(kernelQpcEntry, kernelQpcTerminal, hKernelQpc,
+                                                 hRtlQpc, g_rtlQpcEntry);
+    const bool qpcReady = hRtlQpc && baseCovered && kernelCovered;
+    const size_t patched = PatchQpcIATs();
+    if (patched) Log(L"QPC IAT patch: %zu QueryPerformanceCounter import entries redirected to the locked-clock detour", patched);
     g_timebaseReady.store(qpcReady, std::memory_order_release);
-    if (!qpcReady) SetStatus(L"ERROR: no QueryPerformanceCounter entrypoint could be hooked; locked recording is disabled.");
-    else Log(L"Strict clock hook readiness: ntdll=%d kernelbase=%d kernel32=%d (at least one required)", (int)hRtlQpc, (int)hBaseQpc, (int)hKernelQpc);
+    if (!qpcReady) {
+        wchar_t m[500];
+        swprintf_s(m, L"ERROR: strict LOCKED mode unavailable: QPC coverage incomplete (ntdll=%d kernelbase=%d kernel32=%d; tail-jump coverage kernelbase=%d kernel32=%d).",
+            (int)hRtlQpc, (int)hBaseQpc, (int)hKernelQpc, (int)baseCovered, (int)kernelCovered);
+        SetStatus(m);
+    } else {
+        Log(L"Strict clock hook readiness: ntdll=1 kernelbase=%d kernel32=%d (both public QPC exports are directly hooked or verified to tail-jump into hooked ntdll RtlQPC)",
+            (int)hBaseQpc, (int)hKernelQpc);
+    }
     const wchar_t* mods[] = { L"kernelbase.dll", L"kernel32.dll" };
     for (auto m : mods) {
         Hook(Proc(m, "GetTickCount"), (void*)Hk_GetTickCount, nullptr, "GetTickCount");
@@ -424,7 +587,10 @@ static DXGI_FORMAT Typed(DXGI_FORMAT f) {
 
 // ============================================================ take state + failure reporting
 enum class Api { None, D11, D12, D10, D9, GL };
-static std::mutex        g_stepMx;
+// One gate protects the whole intercepted Present cycle, not just the capture callback.
+// It also synchronizes with ControlThread's stop/release decision.
+static flpresent::SequenceGate g_stepMx;
+static thread_local flpresent::SequenceGate::Guard t_vkPresentGuard;
 static std::atomic<bool> g_rec{ false };          // a take is active
 static bool              g_lockMode = true;        // take mode (locked vs realtime)
 static void*             g_target = nullptr;       // swapchain/device/window being recorded
@@ -643,12 +809,13 @@ static bool WriteTakeInfo(const Job& j) {
     if (j.realtime || j.endCount <= 0) return true;
     if (_wfopen_s(&f, (j.dir + L"\\make_video.bat").c_str(), L"w") != 0 || !f) return false;
     {
-        // -framerate N/D on the input = every image is exactly one frame of 1/FPS; output keeps the same rate (no dup/drop)
+        // Set the exact rational rate on the image-sequence input. Do not add an output
+        // -r conversion: preserve those timestamps instead of asking FFmpeg to resample.
         fwprintf(f, L"@echo off\r\ncd /d \"%%~dp0\"\r\n"
-            L"ffmpeg -y -framerate %lld/%lld -start_number 0 -i frame_%%06d.jpg -c:v libx264 -crf 12 -preset slow -pix_fmt yuv420p -r %lld/%lld output.mp4\r\n"
+            L"ffmpeg -y -framerate %lld/%lld -start_number 0 -i frame_%%06d.jpg -c:v libx264 -crf 12 -preset slow -pix_fmt yuv420p output.mp4\r\n"
             L"echo Expected duration: %.3f s (%lld frames at %lld/%lld fps)\r\npause\r\n",
-            (long long)j.fpsNum, (long long)j.fpsDen, (long long)j.fpsNum, (long long)j.fpsDen,
-            j.endCount / fps, (long long)j.endCount, (long long)j.fpsNum, (long long)j.fpsDen);
+            (long long)j.fpsNum, (long long)j.fpsDen, j.endCount / fps,
+            (long long)j.endCount, (long long)j.fpsNum, (long long)j.fpsDen);
         if (ferror(f) || fflush(f) != 0) ok = false;
         if (fclose(f) != 0) ok = false;
     }
@@ -1431,7 +1598,8 @@ static bool StartTakeImpl(void* obj) {
     g_testTarget = InterlockedExchange(&g_sh->testFrames, 0);
     InterlockedExchange64(&g_sh->framesSaved, 0); InterlockedExchange64(&g_sh->framesCommitted, 0);
     InterlockedExchange64(&g_sh->slipEvents, 0); InterlockedExchange(&g_sh->lastHr, 0);
-    g_takeId++; g_asyncFail = false; g_nextIdx = 0; g_fails = 0; g_target = obj; g_api = Api::None;
+    g_takeId++; g_asyncFail = false; g_nextIdx = 0; g_stepIdx.store(0, std::memory_order_relaxed);
+    g_fails = 0; g_target = obj; g_api = Api::None;
     g_preroll = g_lockMode ? 1 : 0; g_otherPresents = 0;
     g_takeStartReal = RealQPC();
     g_rec = true; InterlockedExchange(&g_sh->isRecording, 1);
@@ -1455,6 +1623,22 @@ static bool StartTake(void* obj) noexcept {
     }
 }
 static void StopTake(const wchar_t* why) noexcept {
+    if (g_lockMode) {
+        const int64_t steps = g_stepIdx.load(std::memory_order_relaxed);
+        // At most one boundary may be pending when F9 arrives just after the previous
+        // PresentPost already advanced to prepare the next frame. That uncommitted step
+        // is discarded on stop and is not included in the exported sequence. More than
+        // one pending step, or fewer boundaries than committed frames, is an integrity error.
+        if (steps < g_nextIdx || steps - g_nextIdx > 1) {
+            Log(L"ERROR: LOCKED boundary invariant failed at stop: %lld committed frames, %lld clock steps",
+                (long long)g_nextIdx, (long long)steps);
+            g_failedTake.store(g_takeId, std::memory_order_release);
+            SetStatus(L"ERROR: LOCKED frame/clock boundary mismatch; this take is invalid and will not be finalized as successful.");
+        } else if (steps - g_nextIdx == 1) {
+            Log(L"CLOCK: one pending, uncommitted boundary discarded on stop (frames=%lld, current step=%lld)",
+                (long long)g_nextIdx, (long long)steps);
+        }
+    }
     ClockStop();
     double wall = (RealQPC() - g_takeStartReal) / (double)g_freq;
     g_rec = false; g_target = nullptr;
@@ -1474,8 +1658,8 @@ static void StopTake(const wchar_t* why) noexcept {
 // Cap: bool(int64_t idx, bool verbose, const wchar_t*& stage, HRESULT& hr) - returns true only after the completed
 // image has been captured, encoded, flushed, and committed to its final sequential filename on disk.
 template <class Cap> static int FrameStepPre(void* obj, Cap& cap) {
+    // Caller holds g_stepMx until FrameStepPost returns.
     if (!g_sh) return 0;
-    std::lock_guard<std::mutex> lk(g_stepMx);
     bool want = InterlockedCompareExchange(&g_sh->wantRecord, 0, 0) != 0;
     if (!g_rec) return (want && StartTake(obj)) ? 1 : 0;
     if (obj != g_target) {
@@ -1517,40 +1701,69 @@ template <class Cap> static int FrameStepPre(void* obj, Cap& cap) {
     return 2;
 }
 static void FrameStepPost(int r) {
+    // Caller still holds g_stepMx, so stop/advance is ordered with FrameStepPre and
+    // ControlThread's ClockRelease decision.
+    const bool continueTake = g_sh && InterlockedCompareExchange(&g_sh->wantRecord, 0, 0) != 0;
     if (g_lockMode) {                                    // locked mode only (real-time mode never touches the clock)
-        if (r == 1 && !ClockStart()) {
-            ReportAsyncFailure(g_takeId, g_nextIdx, L"strict clock initialisation", E_FAIL);
-            SetStatus(L"ERROR: strict clock could not initialise its exact frame boundary; recording stopped.");
-            g_asyncFail = true;
-            if (g_sh) InterlockedExchange(&g_sh->wantRecord, 0);
-        } else if ((r == 2 || r == 3) && g_rec && !ClockAdvance()) {
-            ReportAsyncFailure(g_takeId, g_nextIdx, L"strict clock boundary advance", E_FAIL);
-            SetStatus(L"ERROR: strict clock overflow while advancing a frame boundary; recording stopped.");
-            g_asyncFail = true;
-            if (g_sh) InterlockedExchange(&g_sh->wantRecord, 0);
+        if (r == 1) {
+            if (!continueTake) {
+                StopTake(L"user stop before first locked step");
+            } else if (!ClockStart()) {
+                ReportAsyncFailure(g_takeId, g_nextIdx, L"strict clock initialisation", E_FAIL);
+                SetStatus(L"ERROR: strict clock could not initialise its exact frame boundary; recording stopped.");
+                g_asyncFail = true;
+                if (g_sh) InterlockedExchange(&g_sh->wantRecord, 0);
+            }
+        } else if ((r == 2 || r == 3) && g_rec) {
+            if (continueTake) {
+                if (!ClockAdvance()) {
+                    ReportAsyncFailure(g_takeId, g_nextIdx, L"strict clock boundary advance", E_FAIL);
+                    SetStatus(L"ERROR: strict clock overflow while advancing a frame boundary; recording stopped.");
+                    g_asyncFail = true;
+                    if (g_sh) InterlockedExchange(&g_sh->wantRecord, 0);
+                }
+            } else {
+                // This is the last committed frame (or the user stopped during its commit).
+                // Hold its exact boundary; do not advance one unrecorded simulation interval.
+                Log(L"CLOCK: final committed boundary held at step %lld; no unrecorded step advanced",
+                    (long long)g_stepIdx.load(std::memory_order_relaxed));
+            }
         }
     }
-    // review5: v4 cleared the flag unconditionally, so a Present of ANOTHER swapchain/window on another thread cleared it
-    // while the target was between capture and ClockAdvance -> the stop monitor could release the clock mid-step and
-    // ClockAdvance then moved time BACKWARDS (non-monotonic game time on stop).
+    // Only the thread that marked the target Present busy may clear this state.
     if (t_ownsBusy) { t_ownsBusy = false; g_targetBusy = false; }
 }
 template <class Cap, class Call>
 static auto PresentWrap(void* obj, Cap cap, Call call) -> decltype(call()) {
     if (t_inPresent) return call();          // nested present (e.g. Present -> Present1)
+    // Keep one process-wide gate held until after the original API Present returns and
+    // FrameStepPost has advanced the clock. Without this, another render thread can enter
+    // FrameStepPre in the gap after capture/save but before ClockAdvance and capture the
+    // same frame index (or a different state against the same virtual timestamp).
+    auto sequence = g_stepMx.Enter();
     t_inPresent = true;
+    struct ResetPresentFlag { ~ResetPresentFlag() { t_inPresent = false; } } reset;
     int r = FrameStepPre(obj, cap);
     auto res = call();
     FrameStepPost(r);
-    t_inPresent = false;
     return res;
 }
 
 // ============================================================ core interface (flcore.h) for separate capture modules
 // Thin, behavior-preserving wrappers: the Vulkan layer (vk_layer.cpp) uses exactly the same FrameStepPre/Post,
 // nesting guard and encode queue as the in-file D3D/GL hooks.
-bool FL_BeginPresent() { if (t_inPresent) return false; t_inPresent = true; return true; }
-void FL_EndPresent() { t_inPresent = false; }
+bool FL_BeginPresent() {
+    if (t_inPresent) return false;
+    // Match the DXGI/D3D/OpenGL wrapper: Vulkan also holds the gate across the down-chain
+    // vkQueuePresentKHR call and FrameStepPost, not merely around the capture callback.
+    t_vkPresentGuard = g_stepMx.Enter();
+    t_inPresent = true;
+    return true;
+}
+void FL_EndPresent() {
+    t_inPresent = false;
+    if (t_vkPresentGuard.owns_lock()) t_vkPresentGuard.unlock();
+}
 int FL_StepPre(void* target, FLCaptureFn fn, void* ctx) {
     auto cap = [&](int64_t i, bool v, const wchar_t*& s, HRESULT& h) { return fn(ctx, i, v, &s, &h); };
     return FrameStepPre(target, cap);
@@ -1606,7 +1819,7 @@ static DWORD WINAPI ControlThread(LPVOID) {
             // review5: re-check under the step mutex. Without it the render thread could set g_targetBusy, pass the
             // g_clockReleased check and start capturing between our busy read and ClockRelease(); the following
             // ClockAdvance would then move game time backwards from the released (running) value to B(n+1).
-            std::unique_lock<std::mutex> sl(g_stepMx, std::try_to_lock);
+            auto sl = g_stepMx.TryEnter();
             if (sl.owns_lock() && !g_targetBusy.load() && InterlockedCompareExchange(&g_sh->wantRecord, 0, 0) == 0) ClockRelease();
             continue;
         }
@@ -1915,6 +2128,8 @@ static DWORD WINAPI InitThread(LPVOID) {
         if (!dxgi && tDxgi < 5 && GetModuleHandleW(L"dxgi.dll")) { dxgi = HookDXGI(); tDxgi++; }
         if (!d9 && tD9 < 5 && GetModuleHandleW(L"d3d9.dll")) { d9 = HookD3D9(); tD9++; }
         if (!gl && tGl < 5 && GetModuleHandleW(L"opengl32.dll")) { gl = HookGL(); tGl++; }
+        const size_t lateQpcImports = PatchQpcIATs();
+        if (lateQpcImports) Log(L"QPC IAT patch: %zu late-loaded import entries redirected to the locked-clock detour", lateQpcImports);
         if (GetModuleHandleW(L"vulkan-1.dll") && !FL_VkLayerActive() && g_api == Api::None && !g_rec)
             SetApi(L"Vulkan loaded, FrameLock Vulkan layer NOT active: Vulkan capture needs the game started with 'Launch game .exe and attach' (ignore if the game renders with D3D/OpenGL)");
         Sleep(1000);

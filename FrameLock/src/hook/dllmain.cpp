@@ -20,7 +20,7 @@
 #include <d3d10_1.h>
 #include <d3d10.h>
 #include <d3d11.h>
-#include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <wincodec.h>
@@ -124,7 +124,7 @@ static int64_t FrameTicks(int64_t n) {
 // flushed, and atomically renamed into its final frame_NNNNNN.jpg path. No adaptive hold,
 // wall-clock creep, or watchdog advancement is permitted in strict mode.
 static SRWLOCK              g_clk = SRWLOCK_INIT;
-static flclock::StepState  g_cs = {};
+static flclock::StepState           g_cs = {};
 static std::atomic<bool>    g_lock{ false };
 static std::atomic<int64_t> g_offset{ 0 };          // virtual - real while not locked
 static int64_t              g_recBase = 0;
@@ -786,7 +786,13 @@ static bool DXGIBackBufferIndex(IDXGISwapChain* sc, const DXGI_SWAP_CHAIN_DESC& 
 }
 
 // ============================================================ Direct3D 11 capture (synchronous: copy + blocking Map)
-static struct { ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr;
+struct D3D11ContextLock {
+    ID3D11Multithread* mt = nullptr; bool held = false;
+    explicit D3D11ContextLock(ID3D11Multithread* p) : mt(p) { if (mt) { mt->Enter(); held = true; } }
+    void Leave() { if (held) { mt->Leave(); held = false; } }
+    ~D3D11ContextLock() { Leave(); }
+};
+static struct { ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr; ID3D11Multithread* mt = nullptr;
                 ID3D11Texture2D* staging = nullptr; ID3D11Texture2D* resolved = nullptr;
                 D3D11_TEXTURE2D_DESC desc = {}; PF pf = PF::BGRA8; } g11;
 
@@ -801,12 +807,17 @@ static void D11ReleaseTex() {
 static bool SubmitD3D11(IDXGISwapChain* sc, ID3D11Device* dev, int64_t idx, bool v, const wchar_t*& stage, HRESULT& hr) {
     ID3D11Texture2D* bb = nullptr; bool ok = false;
     do {
-        if (g11.dev != dev || !g11.ctx) {
+        if (g11.dev != dev || !g11.ctx || !g11.mt) {
             D11ReleaseTex();
+            if (g11.mt) g11.mt->Release(); g11.mt = nullptr;
             if (g11.ctx) g11.ctx->Release(); if (g11.dev) g11.dev->Release();
             g11.ctx = nullptr; dev->AddRef(); g11.dev = dev; dev->GetImmediateContext(&g11.ctx);
             if (!g11.ctx) { stage = L"D3D11 GetImmediateContext"; hr = E_POINTER; break; }
-            Log(L"[D3D11] device %p, feature level 0x%X", dev, (unsigned)dev->GetFeatureLevel());
+            stage = L"D3D11 immediate-context multithread guard";
+            hr = g11.ctx->QueryInterface(__uuidof(ID3D11Multithread), (void**)&g11.mt);
+            if (FAILED(hr) || !g11.mt) { hr = FAILED(hr) ? hr : E_NOINTERFACE; break; }
+            g11.mt->SetMultithreadProtected(TRUE); // serialize our readback with any game worker using the immediate context
+            Log(L"[D3D11] device %p, feature level 0x%X, immediate-context multithread protection enabled", dev, (unsigned)dev->GetFeatureLevel());
         }
         DXGI_SWAP_CHAIN_DESC sd = {};
         stage = L"D3D11 SwapChain::GetDesc"; hr = sc->GetDesc(&sd); if (FAILED(hr)) break;
@@ -833,6 +844,7 @@ static bool SubmitD3D11(IDXGISwapChain* sc, ID3D11Device* dev, int64_t idx, bool
             sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0; sd.MipLevels = 1; sd.ArraySize = 1;
             stage = L"D3D11 CreateTexture2D(staging)"; hr = dev->CreateTexture2D(&sd, nullptr, &g11.staging); if (FAILED(hr)) break;
         }
+        D3D11ContextLock contextLock(g11.mt);
         ID3D11Texture2D* src = bb;
         if (d.SampleDesc.Count > 1) {
             if (!g11.resolved) {
